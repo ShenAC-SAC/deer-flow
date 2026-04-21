@@ -59,6 +59,37 @@ class MemoryConfig(BaseModel):
         le=8000,
         description="Maximum tokens to use for memory injection",
     )
+    # Single-writer queue (RFC #2283) tunables.  These only apply when the
+    # configured ``storage_class`` is ``SQLiteMemoryStorage``; with file
+    # storage they are ignored.
+    lock_stale_seconds: int = Field(
+        default=90,
+        ge=10,
+        le=3600,
+        description=(
+            "Writer lease is considered dead after this many seconds without "
+            "a heartbeat renewal. Must be at least 3x heartbeat_interval_seconds."
+        ),
+    )
+    heartbeat_interval_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=600,
+        description=(
+            "Writer lease heartbeat period. Must be strictly less than "
+            "lock_stale_seconds / 2 so three missed heartbeats are required "
+            "before the lease is considered stale."
+        ),
+    )
+    processing_timeout_seconds: int = Field(
+        default=300,
+        ge=10,
+        le=86400,
+        description=(
+            "Maximum time a queue task may remain in the 'processing' state "
+            "before reset_stuck_tasks() moves it back to 'pending'."
+        ),
+    )
 
 
 # Global configuration instance
