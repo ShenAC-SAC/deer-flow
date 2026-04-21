@@ -57,13 +57,23 @@ _GLOBAL_KEY = "__global__"
 _DEFAULT_USER = "__default__"
 
 
-def _connect(db_path: Path) -> sqlite3.Connection:
-    """Open a WAL-mode SQLite connection that is safe to share across threads."""
+def connect(db_path: Path) -> sqlite3.Connection:
+    """Open a WAL-mode SQLite connection that is safe to share across threads.
+
+    Public helper — intentionally exported so companion modules (e.g. the
+    single-writer queue in :mod:`deerflow.agents.memory.writer_queue`) can
+    reuse the same connection semantics without depending on private names.
+    """
     conn = sqlite3.connect(str(db_path), timeout=10, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+# Backwards-compatible private alias; kept so existing imports elsewhere in the
+# module (and any external callers still on the pre-RFC #2283 API) keep working.
+_connect = connect
 
 
 def init_memory_schema(db_path: Path) -> None:

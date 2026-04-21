@@ -20,12 +20,7 @@ import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from deerflow.agents.memory.sqlite_storage import (
-    SCHEMA_SQL as _STORAGE_SCHEMA_SQL,
-)
-from deerflow.agents.memory.sqlite_storage import (
-    _connect,
-)
+from deerflow.agents.memory.sqlite_storage import connect, init_memory_schema
 from deerflow.agents.memory.storage import utc_now_iso_z
 from deerflow.config.memory_config import get_memory_config
 
@@ -71,6 +66,14 @@ CREATE TABLE IF NOT EXISTS memory_writer_lock (
 # same process (e.g. when ``flush()`` races the debounce timer).  Acquired in
 # :func:`schedule_memory_update`, released inside :func:`run_writer_loop`.
 _writer_running = threading.Lock()
+
+# Per-path schema-init cache.  ``CREATE TABLE IF NOT EXISTS`` is cheap, but
+# each call still opens/closes a fresh SQLite connection; caching keeps the
+# hot path (``enqueue`` → ``try_acquire_writer``) from paying that cost on
+# every queue event.  The cache key is the resolved absolute path so
+# different DBs used in the same process are tracked independently.
+_SCHEMA_INITIALISED: set[str] = set()
+_SCHEMA_INIT_LOCK = threading.Lock()
 
 
 # ── Internal helpers ────────────────────────────────────────────────────────
@@ -149,16 +152,36 @@ def init_queue_schema(db_path: Path) -> None:
     """Idempotently create the queue + lock tables (and the storage table).
 
     Exposed so callers that bootstrap the writer queue before ever calling
-    :class:`SQLiteMemoryStorage` still get a usable ``memory.db``.
+    :class:`SQLiteMemoryStorage` still get a usable ``memory.db``.  The
+    companion storage schema is delegated to
+    :func:`deerflow.agents.memory.sqlite_storage.init_memory_schema` so the
+    queue module no longer has to know the ``agent_memory`` DDL.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = _connect(db_path)
+    init_memory_schema(db_path)
+    conn = connect(db_path)
     try:
-        conn.executescript(_STORAGE_SCHEMA_SQL)
         conn.executescript(_QUEUE_SCHEMA_SQL)
         conn.commit()
     finally:
         conn.close()
+    with _SCHEMA_INIT_LOCK:
+        _SCHEMA_INITIALISED.add(str(db_path.resolve()))
+
+
+def _ensure_schema(db_path: Path) -> None:
+    """Fast-path wrapper around :func:`init_queue_schema`.
+
+    ``init_queue_schema`` is idempotent but opens two short-lived SQLite
+    connections and runs ``CREATE TABLE IF NOT EXISTS`` scripts, which is
+    measurable overhead on the hot enqueue path.  We track paths already
+    initialised in this process and skip the work on subsequent calls.
+    """
+    key = str(db_path.resolve())
+    with _SCHEMA_INIT_LOCK:
+        if key in _SCHEMA_INITIALISED:
+            return
+    init_queue_schema(db_path)
 
 
 # ── Heartbeat thread ────────────────────────────────────────────────────────
@@ -178,7 +201,7 @@ class _HeartbeatThread(threading.Thread):
     def run(self) -> None:  # pragma: no cover - exercised indirectly
         while not self._stop_event.wait(timeout=self._interval):
             try:
-                conn = _connect(self._db_path)
+                conn = connect(self._db_path)
                 try:
                     conn.execute(
                         "UPDATE memory_writer_lock "
@@ -211,11 +234,11 @@ def enqueue(
     """Append a conversation context to the pending queue."""
     from langchain_core.messages import messages_to_dict
 
-    init_queue_schema(db_path)
+    _ensure_schema(db_path)
     serialised = messages_to_dict(messages) if messages else []
     name = agent_name if agent_name is not None else "__global__"
 
-    conn = _connect(db_path)
+    conn = connect(db_path)
     try:
         conn.execute(
             """
@@ -241,10 +264,10 @@ def enqueue(
 
 def reset_stuck_tasks(db_path: Path) -> int:
     """Move tasks that have been ``'processing'`` too long back to ``'pending'``."""
-    init_queue_schema(db_path)
+    _ensure_schema(db_path)
     _, _, processing_timeout = _get_timings()
     cutoff = _utc_minus_seconds(processing_timeout)
-    conn = _connect(db_path)
+    conn = connect(db_path)
     try:
         cursor = conn.execute(
             """
@@ -266,10 +289,10 @@ def reset_stuck_tasks(db_path: Path) -> int:
 
 def try_acquire_writer(db_path: Path, worker_id: str) -> bool:
     """Attempt to take the single-writer lease.  Returns True on success."""
-    init_queue_schema(db_path)
+    _ensure_schema(db_path)
     lock_stale, _, _ = _get_timings()
     now = utc_now_iso_z()
-    conn = _connect(db_path)
+    conn = connect(db_path)
     try:
         conn.execute("BEGIN EXCLUSIVE")
         row = conn.execute(
@@ -313,7 +336,7 @@ def try_acquire_writer(db_path: Path, worker_id: str) -> bool:
 
 def _release_writer(db_path: Path, worker_id: str) -> None:
     try:
-        conn = _connect(db_path)
+        conn = connect(db_path)
         try:
             conn.execute(
                 "DELETE FROM memory_writer_lock WHERE id = 1 AND worker_id = ?",
@@ -343,7 +366,7 @@ def run_writer_loop(db_path: Path, worker_id: str) -> None:
     heartbeat.start()
 
     try:
-        conn = _connect(db_path)
+        conn = connect(db_path)
         try:
             while True:
                 task = None
@@ -433,28 +456,39 @@ def run_writer_loop(db_path: Path, worker_id: str) -> None:
                 pass
 
 
-def schedule_memory_update(
+def schedule_memory_updates(
     db_path: Path,
-    agent_name: str | None,
-    messages: list,
-    thread_id: str | None,
-    correction_detected: bool = False,
-    reinforcement_detected: bool = False,
+    contexts: list[dict],
 ) -> None:
-    """Enqueue and, if possible, become the writer.
+    """Enqueue a batch of conversation contexts and, if possible, become the writer.
 
-    Safe to call from ``threading.Timer`` callbacks: no event loop required.
+    Each item in *contexts* is a mapping with the keys ``agent_name``,
+    ``messages``, ``thread_id`` and the optional flags
+    ``correction_detected`` / ``reinforcement_detected``.  Missing flags
+    default to ``False``.
+
+    This is the preferred entry point when the debounced in-memory queue
+    drains several conversation contexts in one tick (RFC #2283): the
+    schema bootstrap, stuck-task reset and writer-lease acquisition each
+    run exactly once per batch instead of once per queued item — the
+    per-item form repeatedly opened short-lived SQLite connections for
+    work that is trivially batchable.
     """
-    init_queue_schema(db_path)
+    if not contexts:
+        return
+
+    _ensure_schema(db_path)
     reset_stuck_tasks(db_path)
-    enqueue(
-        db_path,
-        agent_name,
-        messages,
-        thread_id,
-        correction_detected=correction_detected,
-        reinforcement_detected=reinforcement_detected,
-    )
+
+    for ctx in contexts:
+        enqueue(
+            db_path,
+            ctx.get("agent_name"),
+            ctx.get("messages") or [],
+            ctx.get("thread_id"),
+            correction_detected=bool(ctx.get("correction_detected", False)),
+            reinforcement_detected=bool(ctx.get("reinforcement_detected", False)),
+        )
 
     if not _writer_running.acquire(blocking=False):
         return  # a writer thread is already active in this process
@@ -469,11 +503,38 @@ def schedule_memory_update(
         ).start()
     else:
         # Did not become the writer; another live process owns the lease and
-        # will process our enqueued task.  Release the in-process guard.
+        # will process our enqueued tasks.  Release the in-process guard.
         try:
             _writer_running.release()
         except RuntimeError:  # pragma: no cover - defensive
             pass
+
+
+def schedule_memory_update(
+    db_path: Path,
+    agent_name: str | None,
+    messages: list,
+    thread_id: str | None,
+    correction_detected: bool = False,
+    reinforcement_detected: bool = False,
+) -> None:
+    """Enqueue a single conversation context and, if possible, become the writer.
+
+    Thin wrapper around :func:`schedule_memory_updates`.  Safe to call from
+    ``threading.Timer`` callbacks: no event loop required.
+    """
+    schedule_memory_updates(
+        db_path,
+        [
+            {
+                "agent_name": agent_name,
+                "messages": messages,
+                "thread_id": thread_id,
+                "correction_detected": correction_detected,
+                "reinforcement_detected": reinforcement_detected,
+            }
+        ],
+    )
 
 
 def trim_queue(db_path: Path, keep_days: int = 7) -> int:
@@ -483,11 +544,11 @@ def trim_queue(db_path: Path, keep_days: int = 7) -> int:
     maintenance job; never blocks the writer loop because each call uses its
     own short-lived connection and WAL mode permits concurrent reads.
     """
-    init_queue_schema(db_path)
+    _ensure_schema(db_path)
     if keep_days < 0:
         raise ValueError("keep_days must be non-negative")
     cutoff = _utc_minus_seconds(keep_days * 86400)
-    conn = _connect(db_path)
+    conn = connect(db_path)
     try:
         cursor = conn.execute(
             "DELETE FROM memory_update_queue "
@@ -514,7 +575,7 @@ def migrate_json_to_sqlite(
     """
     from deerflow.agents.memory.sqlite_storage import SQLiteMemoryStorage
 
-    init_queue_schema(db_path)
+    _ensure_schema(db_path)
     with open(json_path, encoding="utf-8") as f:
         data = json.load(f)
 
@@ -544,6 +605,7 @@ __all__ = [
     "reset_stuck_tasks",
     "run_writer_loop",
     "schedule_memory_update",
+    "schedule_memory_updates",
     "trim_queue",
     "try_acquire_writer",
 ]

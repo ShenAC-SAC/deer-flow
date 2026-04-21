@@ -1,6 +1,6 @@
 """Configuration for memory mechanism."""
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class MemoryConfig(BaseModel):
@@ -90,6 +90,26 @@ class MemoryConfig(BaseModel):
             "before reset_stuck_tasks() moves it back to 'pending'."
         ),
     )
+
+    @model_validator(mode="after")
+    def _validate_writer_queue_timings(self) -> "MemoryConfig":
+        """Enforce ``heartbeat_interval_seconds * 2 < lock_stale_seconds``.
+
+        This is the safety margin described in RFC #2283: the lease must only
+        be considered stale after at least two missed heartbeats so a briefly
+        delayed writer (e.g. GIL contention, a long LLM call) does not lose
+        its lease to a racing process.  Moving the check here means invalid
+        configs fail fast at load time rather than being silently clamped on
+        every writer-queue call.
+        """
+        if self.heartbeat_interval_seconds * 2 >= self.lock_stale_seconds:
+            raise ValueError(
+                "heartbeat_interval_seconds must be strictly less than "
+                "lock_stale_seconds / 2 to preserve the two-missed-heartbeats "
+                f"safety margin (got heartbeat={self.heartbeat_interval_seconds}s, "
+                f"lock_stale={self.lock_stale_seconds}s)."
+            )
+        return self
 
 
 # Global configuration instance
