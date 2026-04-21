@@ -68,7 +68,10 @@ class MemoryConfig(BaseModel):
         le=3600,
         description=(
             "Writer lease is considered dead after this many seconds without "
-            "a heartbeat renewal. Must be at least 3x heartbeat_interval_seconds."
+            "a heartbeat renewal. Must be strictly greater than "
+            "2 * heartbeat_interval_seconds (enforced by the cross-field "
+            "validator below) so two missed heartbeats are required before "
+            "the lease is considered stale."
         ),
     )
     heartbeat_interval_seconds: int = Field(
@@ -77,8 +80,9 @@ class MemoryConfig(BaseModel):
         le=600,
         description=(
             "Writer lease heartbeat period. Must be strictly less than "
-            "lock_stale_seconds / 2 so three missed heartbeats are required "
-            "before the lease is considered stale."
+            "lock_stale_seconds / 2 (enforced by the cross-field validator "
+            "below) so two missed heartbeats are required before the lease "
+            "is considered stale."
         ),
     )
     processing_timeout_seconds: int = Field(
@@ -95,8 +99,8 @@ class MemoryConfig(BaseModel):
     def _validate_writer_queue_timings(self) -> "MemoryConfig":
         """Enforce ``heartbeat_interval_seconds * 2 < lock_stale_seconds``.
 
-        This is the safety margin described in RFC #2283: the lease must only
-        be considered stale after at least two missed heartbeats so a briefly
+        This is the safety margin described in RFC #2283: the lease is only
+        declared stale after at least two missed heartbeats, so a briefly
         delayed writer (e.g. GIL contention, a long LLM call) does not lose
         its lease to a racing process.  Moving the check here means invalid
         configs fail fast at load time rather than being silently clamped on
